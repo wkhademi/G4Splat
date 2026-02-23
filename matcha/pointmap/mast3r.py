@@ -219,7 +219,7 @@ def get_pointmap_with_mast3r(
         n_images_in_pointmap = len(image_indices)
         
     _img_paths = [cameras['filepaths'][i] for i in image_indices]
-    _focals = [[cameras['focals'][i]] for i in image_indices]
+    _focals = [cameras['focals'][i] for i in image_indices]
     _poses = [cameras['cams2world'][i] for i in image_indices]
     print("Indices of the images in the pointmap:", image_indices)
     
@@ -257,7 +257,7 @@ def get_pointmap_with_mast3r(
         img.resize((int(round(_original_images_width * resize_factor)), int(round(_original_images_height * resize_factor))), Image.LANCZOS)
     ) / 255. for img in _original_images]    
     _points3d = [np.array(pts).reshape(np.array(_images)[0].shape) for pts in scene['points']]
-    
+
     # Build PointMap
     scene_pm = PointMap(
         img_paths=_img_paths,
@@ -337,15 +337,18 @@ def get_sfm_data_from_mast3r_pointmap(
         max_sfm_points_per_frame = max_sfm_points // n_images_in_pointmap
     sfm_xyz = torch.zeros(0, 3, device=device)
     sfm_col = torch.zeros(0, 3, device=device)
+    sfm_conf = torch.zeros(0, device=device)
     image_sfm_points = {}
 
     for i_frame in range(n_images_in_pointmap):
         all_frame_pts = mast3r_pm.points3d[i_frame].view(-1, 3)
         all_frame_col = mast3r_pm.images[i_frame].view(-1, 3)
+        all_frame_conf = mast3r_pm.confidence[i_frame].view(-1)
         
         mask = mast3r_pm.confidence[i_frame].view(-1) > sfm_confidence_threshold
         all_frame_pts = all_frame_pts[mask]
         all_frame_col = all_frame_col[mask]
+        all_frame_conf = all_frame_conf[mask]
         
         if max_sfm_points is None:
             sampled_idx = torch.arange(all_frame_pts.shape[0], device=device)
@@ -357,13 +360,15 @@ def get_sfm_data_from_mast3r_pointmap(
         
         sfm_xyz = torch.cat([sfm_xyz, all_frame_pts[sampled_idx]], dim=0)
         sfm_col = torch.cat([sfm_col, all_frame_col[sampled_idx]], dim=0)
-        
+        sfm_conf = torch.cat([sfm_conf, all_frame_conf[sampled_idx]], dim=0)
+
     sfm_data = {
         'pointmap_cameras': mast3r_pointmap_cameras,
         'training_cameras': mast3r_cameras,
         'test_cameras': None,
         'sfm_xyz': sfm_xyz,
         'sfm_col': sfm_col,
+        'sfm_conf': sfm_conf,
         'image_sfm_points': image_sfm_points,
     }
     return sfm_data

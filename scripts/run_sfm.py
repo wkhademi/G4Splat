@@ -94,6 +94,7 @@ if __name__ == '__main__':
         "--fix_principal_point" if config['fix_principal_point'] else "",
         "--fix_rotation" if config['fix_rotation'] else "",
         "--fix_translation" if config['fix_translation'] else "",
+        "--fix_depth" if config['fix_depth'] else "",
         "--n_images", str(args.n_images),
         "--use_all_images" if args.use_all_images else "",
         "--image_idx" if args.image_idx is not None else "", 

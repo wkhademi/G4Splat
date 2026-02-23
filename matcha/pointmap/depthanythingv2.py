@@ -24,6 +24,7 @@ from matcha.pointmap.mast3r import compute_mast3r_scene
 from matcha.dm_scene.cameras import CamerasWrapper, P3DCameras
 from matcha.dm_utils.rendering import fov2focal
 
+import trimesh
 from PIL import Image
 from sklearn.linear_model import RANSACRegressor
 
@@ -99,10 +100,12 @@ def get_points_depth_in_depthmap(
     
     depth_view = depthmap.reshape(1, image_height, image_width, 1).permute(0, 3, 1, 2)
     pts_projections = p3d_camera.get_full_projection_transform().transform_points(pts)
+    print(pts_projections)
 
     factor = -1 * min(image_height, image_width)
     pts_projections[..., 0] = factor / image_width * pts_projections[..., 0]
     pts_projections[..., 1] = factor / image_height * pts_projections[..., 1]
+    print(pts_projections)
     pts_projections = pts_projections[..., :2].view(1, -1, 1, 2)
 
     map_z = torch.nn.functional.grid_sample(
@@ -527,7 +530,6 @@ def get_pointmap_from_see3d_with_depthanything(
         
         # Points3d
         inv_depth = apply_depthanything(model, image_i)  # Compute inverse depths with DepthAnything
-        
         depth = fit_depth_to_point_cloud(
             disp=inv_depth, 
             pts=pts,
@@ -582,6 +584,7 @@ def get_pointmap_from_sfm_data_with_depthanything(
     test_cameras:CamerasWrapper,
     sfm_xyz:torch.Tensor,
     sfm_col:torch.Tensor,
+    sfm_conf:torch.Tensor,
     image_sfm_points:list,
     image_dir:str,
     # 
@@ -646,7 +649,7 @@ def get_pointmap_from_sfm_data_with_depthanything(
         gt_image = pointmap_cameras.gs_cameras[cam_idx].original_image.permute(1, 2, 0)
         _height, _width = gt_image.shape[:2]
         image_i = gt_image.view(_height, _width, 3)
-        
+
         # Original image
         original_gt_image = training_cameras.gs_cameras[cam_idx].original_image.permute(1, 2, 0)
         height, width = original_gt_image.shape[:2]
@@ -666,7 +669,7 @@ def get_pointmap_from_sfm_data_with_depthanything(
         pose_i = C2W.view(4, 4)
         
         # Points3d
-        cam_sfm_pts = sfm_xyz[image_sfm_points[image_name]]
+        cam_sfm_pts = sfm_xyz[image_sfm_points[image_name]][sfm_conf[image_sfm_points[image_name]] > 0.0]
         inv_depth = apply_depthanything(model, gt_image)  # Compute inverse depths with DepthAnything
         depth = fit_depth_to_point_cloud(
             disp=inv_depth, 
@@ -679,7 +682,7 @@ def get_pointmap_from_sfm_data_with_depthanything(
             use_rasterizer=False,
         )  # Scale depths to match the corresponding visible SfM points
         points3d_i = pointmap_cameras.backproject_depth(cam_idx=cam_idx, depth=depth).view(_height, _width, 3)
-        
+
         # Confidence
         confidence_i = torch.ones_like(points3d_i[..., 2]) * 1e8
         
@@ -959,6 +962,7 @@ def get_pointmap_from_mast3r_scene_with_depthanything(
         test_cameras=mast3r_sfm_data['test_cameras'],
         sfm_xyz=mast3r_sfm_data['sfm_xyz'],
         sfm_col=mast3r_sfm_data['sfm_col'],
+        sfm_conf=mast3r_sfm_data['sfm_conf'],
         image_sfm_points=mast3r_sfm_data['image_sfm_points'],
         image_dir=source_path,
         # 

@@ -20,6 +20,7 @@ fix_focal: True
 fix_principal_point: True
 fix_rotation: True
 fix_translation: True
+fix_depth: True
 
 # Postprocessing
 TSDF_thresh: 0.0

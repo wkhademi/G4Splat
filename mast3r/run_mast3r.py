@@ -3,6 +3,7 @@ import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import math
+import h5py
 import gradio
 import numpy as np
 import functools
@@ -12,6 +13,8 @@ from scipy.spatial.transform import Rotation
 import tempfile
 import shutil
 import torch
+
+from PIL import Image as PILImage
 
 from mast3r.cloud_opt.sparse_ga import sparse_global_alignment
 from mast3r.cloud_opt.tsdf_optimizer import TSDFPostProcess
@@ -32,6 +35,7 @@ from matcha.dm_utils.dataset_readers import read_intrinsics_binary, read_extrins
 # from colmap.read_write_model import read_cameras_binary, read_images_binary, read_points3D_binary
 from colmap.read_write_model import Camera, Image, Point3D,  write_cameras_binary, write_images_binary, write_points3D_binary, write_points3D_text, rotmat2qvec
 from colmap.read_write_model import write_cameras_text, write_images_text, write_points3D_text
+from colmap.colmap_utils import read_cameras_text, undistorted_camera, camera_to_intrinsic
 import open3d as o3d
 
 import argparse
@@ -67,7 +71,8 @@ if __name__ == "__main__":
     parser.add_argument('--fix_principal_point', action='store_true', help='Fix camera principal point.')
     parser.add_argument('--fix_rotation', action='store_true', help='Fix camera rotation.')
     parser.add_argument('--fix_translation', action='store_true', help='Fix camera translation.')
-    
+    parser.add_argument('--fix_depth', action='store_true', help='Fix camera depth.')
+
     # Data parameters
     parser.add_argument('--n_images', type=int, default=10, help='Number of images to use for optimization, sampled with constant spacing.')
     parser.add_argument('--use_all_images', action='store_true', help='Use all images for optimization.')
@@ -88,7 +93,7 @@ if __name__ == "__main__":
     parser.add_argument('--align_camera_locations', action='store_true', help='Align camera locations.')
 
     args = parser.parse_args()
-    debug_verbose = False
+    debug_verbose = True
     def print_debug(*args, **kwargs):
         if debug_verbose:
             print(*args, **kwargs)
@@ -226,6 +231,127 @@ if __name__ == "__main__":
                         [0., fl_y, cy],
                         [0., 0., 1.]
                     ])
+
+            elif os.path.isdir(f'{scene_path}/poses'):
+                print("Loading calibrated poses from 3DFront")
+                src_intrinsics = {}
+                src_extrinsics = {}
+                src_depths = {}
+                pose_files = os.listdir(f'{scene_path}/poses')
+                intrinsics = np.round(np.load(f'{scene_path}/cam_K.npy'))
+                for pose_file in pose_files:
+                    view_id = int(pose_file.split('.')[0])
+                    img_name = f'{view_id:06d}_rgb.png'
+
+                    with h5py.File(os.path.join(scene_path, "poses", pose_file), "r") as f:
+                        c2w = np.array(f["cam_Ts"])
+                        depth = np.array(f["depth"])[:, ::-1].astype(np.float32)
+                        depth[depth >= 10000000000.0] = 0.0
+
+                    # blender camera to opengl camera
+                    y_z_swap = np.array([[1, 0, 0, 0], [0, 0, 1, 0], [0, 1, 0, 0], [0, 0, 0, 1]])
+                    c2w = y_z_swap.dot(c2w)
+                    c2w[:3, 0] *= -1
+
+                    # opengl camera to opencv (COLMAP) camera
+                    c2w[:3, 1] *= -1
+                    c2w[:3, 2] *= -1
+
+                    # Rotate the pose -90 degrees about the x-axis (in radians)
+                    angle = np.pi / 2
+                    Rx = np.array([
+                        [1, 0, 0, 0],
+                        [0, np.cos(angle), -np.sin(angle), 0],
+                        [0, np.sin(angle),  np.cos(angle), 0],
+                        [0, 0, 0, 1]
+                    ])
+                    c2w = Rx @ c2w
+
+                    src_extrinsics[img_name] = np.linalg.inv(c2w)
+                    
+                    # get intrinsics
+                    src_intrinsics[img_name] = intrinsics
+
+                    # convert depth image to MASt3R image size
+                    depth_img = PILImage.fromarray(depth)
+                    S = max(depth_img.size)
+                    new_size = tuple(int(round(x*args.image_size/S)) for x in depth_img.size)
+                    depth_img = depth_img.resize(new_size, PILImage.NEAREST)
+                    W, H = depth_img.size
+                    cx, cy = W//2, H//2
+                    halfw, halfh = ((2*cx)//16)*8, ((2*cy)//16)*8
+                    if W == H:
+                        halfh = 3*halfw/4
+                    depth_img = depth_img.crop((cx-halfw, cy-halfh, cx+halfw, cy+halfh))
+                    src_depths[img_name] = np.array(depth_img)
+
+            elif os.path.isdir(f'{scene_path}/extrinsics'):
+                print("Loading calibrated poses from ScanNet++")
+                src_intrinsics = {}
+                src_extrinsics = {}
+                src_depths = {}
+
+                # load intrinsics from COLMAP format
+                intrinsics_file = f'{scene_path}/cameras.txt'
+                colmap_camera = list(read_cameras_text(intrinsics_file).values())[0]
+                pinhole_camera = undistorted_camera(colmap_camera)
+                intrinsics = camera_to_intrinsic(pinhole_camera)
+
+                # rescale intrinsics to match loaded image size
+                height, width = pinhole_camera.height, pinhole_camera.width
+                s_x = 480.0 / float(width)
+                s_y = 360.0 / float(height)
+                intrinsics[0, 0] *= s_x
+                intrinsics[1, 1] *= s_y
+                intrinsics[0, 2] = 480.0 / 2.
+                intrinsics[1, 2] = 360.0 / 2.
+
+                pose_files = os.listdir(f'{scene_path}/extrinsics')
+                for pose_file in pose_files:
+                    view_id = int(pose_file.split('.')[0])
+                    img_name = f'{view_id:06d}_rgb.png'
+                    depth_file = f'{view_id:06d}_depth.npy'
+
+                    # load pose
+                    c2w = np.loadtxt(os.path.join(scene_path, "extrinsics", pose_file))
+
+                    # swap y and z axes by multiplying with transformation matrix
+                    # swap_yz = np.array([
+                    #     [1, 0, 0, 0],
+                    #     [0, 0, 1, 0], 
+                    #     [0, 1, 0, 0],
+                    #     [0, 0, 0, 1]
+                    # ], dtype=np.float32)
+                    # c2w = swap_yz @ c2w
+
+                    # Rotate the pose 90 degrees about the x-axis (in radians)
+                    # angle = np.pi / 2
+                    # Rx = np.array([
+                    #     [1, 0, 0, 0],
+                    #     [0, np.cos(angle), -np.sin(angle), 0],
+                    #     [0, np.sin(angle),  np.cos(angle), 0],
+                    #     [0, 0, 0, 1]
+                    # ])
+                    # c2w = Rx @ c2w
+
+                    src_extrinsics[img_name] = np.linalg.inv(c2w)
+                    
+                    # get intrinsics
+                    src_intrinsics[img_name] = intrinsics
+
+                    # convert depth image to MASt3R image size
+                    depth = np.load(os.path.join(scene_path, "depths", depth_file))
+                    depth_img = PILImage.fromarray(depth)
+                    S = max(depth_img.size)
+                    new_size = tuple(int(round(x*args.image_size/S)) for x in depth_img.size)
+                    depth_img = depth_img.resize(new_size, PILImage.NEAREST)
+                    W, H = depth_img.size
+                    cx, cy = W//2, H//2
+                    halfw, halfh = ((2*cx)//16)*8, ((2*cy)//16)*8
+                    if W == H:
+                        halfh = 3*halfw/4
+                    depth_img = depth_img.crop((cx-halfw, cy-halfh, cx+halfw, cy+halfh))
+                    src_depths[img_name] = np.array(depth_img)
                     
             else:
                 raise FileNotFoundError(f'Calibration data ({scene_path}/sparse/0/) not found.')
@@ -256,6 +382,7 @@ if __name__ == "__main__":
     fix_pp = args.fix_principal_point
     fix_rotation = args.fix_rotation
     fix_translation = args.fix_translation
+    fix_depth = args.fix_depth
 
     lr1 = 0.07
     niter1 = args.n_coarse_iterations
@@ -508,8 +635,8 @@ if __name__ == "__main__":
             tar_focal_y = tar_focal * np.sqrt(s_w * s_h) / s_h
             tar_K = src_K.copy()
             tar_K[:2,2] = tar_pp
-            tar_K[0,0] = tar_focal_x
-            tar_K[1,1] = tar_focal_y
+            # tar_K[0,0] = tar_focal_x
+            # tar_K[1,1] = tar_focal_y
             map1, map2 = cv2.initUndistortRectifyMap(
                 src_K, src_dist, None, 
                 tar_K, 2 * tar_pp,
@@ -542,6 +669,7 @@ if __name__ == "__main__":
         print_debug(intrinsics)
 
         # Modify intrinsics according to MASt3R resizing
+        real_focals = []
         for idx_img, img in enumerate(imgs):
             # Get size of MASt3R images
             height_resized, width_resized = img['img'].size()[-2:]
@@ -564,6 +692,8 @@ if __name__ == "__main__":
             intrinsics[idx_img][0,2] -= ofs_u  
             intrinsics[idx_img][1,2] -= ofs_v
             
+
+            real_focals.append([intrinsics[idx_img][0,0], intrinsics[idx_img][1,1]])
             # ==========ADDED: Save Cropped Image==========
             if True and False:
                 from torchvision.transforms.functional import center_crop
@@ -681,11 +811,42 @@ if __name__ == "__main__":
     scene = scene_state.sparse_ga
     rgbimg = scene.imgs
     focals = scene.get_focals().cpu()
+    real_focals = torch.tensor(real_focals, dtype=torch.float32)
+    focals = real_focals
     pps = scene.get_principal_points().cpu()
     cams2world = scene.get_im_poses().cpu()
 
     # 3D pointcloud from depthmap, poses and intrinsics
-    if TSDF_thresh > 0:
+    if fix_depth:
+        pts3d = []
+        confs = []
+        for idx_view, img_name in enumerate(image_names):
+            K = intrinsics[idx_view]
+            pose = np.linalg.inv(extrinsics[idx_view])
+            depth = src_depths[img_name]
+
+            conf = np.zeros_like(depth)
+            conf[depth > 0] = 10.0
+
+            u, v = np.meshgrid(range(depth.shape[1]), range(depth.shape[0]))
+            u = u.reshape([1, -1])[0]
+            v = v.reshape([1, -1])[0]
+
+            z = depth[v, u]
+
+            # calculate coordinates
+            x = (u - K[0][2]) * z / K[0][0]
+            y = (v - K[1][2]) * z / K[1][1]
+            point_cam = np.vstack([x, y, z]).T
+
+            # camera to world coordinates
+            R = pose[:3, :3]
+            T = pose[:3, 3]
+            point_canonical = point_cam.dot(R.T) + T
+
+            pts3d.append(point_canonical)
+            confs.append(conf)
+    elif TSDF_thresh > 0:
         print('TSDF post-processing...')
         tsdf = TSDFPostProcess(scene, TSDF_thresh=TSDF_thresh)
         pts3d, _, confs = to_numpy(tsdf.get_dense_pts3d(clean_depth=clean_depth))
@@ -717,9 +878,9 @@ if __name__ == "__main__":
             print_debug('Mean residual of camera locations:', mean_residual)
 
             # Modify camera poses and 3D points
-            cams2world[:,:3,3] = scale_est2calib * cams2world[:,:3,3] + torch.from_numpy(ofs_est2calib).to(cams2world.device)
-            for i_ in range(len(pts3d)):
-                pts3d[i_] = scale_est2calib * pts3d[i_] + ofs_est2calib
+            # cams2world[:,:3,3] = scale_est2calib * cams2world[:,:3,3] + torch.from_numpy(ofs_est2calib).to(cams2world.device)
+            # for i_ in range(len(pts3d)):
+            #     pts3d[i_] = scale_est2calib * pts3d[i_] + ofs_est2calib
 
         else:
             # Modify rotation, scale, and translaion
@@ -782,8 +943,8 @@ if __name__ == "__main__":
             width=width_original, 
             height=height_original, 
             params=np.array([
-                focals[idx_img].item() * scale_w,
-                focals[idx_img].item() * scale_h,
+                focals[idx_img][0].item() * scale_w,
+                focals[idx_img][1].item() * scale_h,
                 (pps[idx_img][0].item() + ofs_u) * scale_w,
                 (pps[idx_img][1].item() + ofs_v) * scale_h,
             ])
@@ -801,6 +962,7 @@ if __name__ == "__main__":
         # TODO: avoid slow for-loop
         for idx_pt2d, (xyz, pt2d) in enumerate(zip(pts3d[idx_img], pixels_original)):
             pixel_conf = confs[idx_img][pixels[idx_pt2d][1], pixels[idx_pt2d][0]]
+            # print(pixel_conf)
             if pixel_conf < output_conf_thr: # ignore points with low confidence
                 continue
 
