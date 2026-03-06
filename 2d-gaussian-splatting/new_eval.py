@@ -1,4 +1,5 @@
 import os
+import io
 import sys
 import json
 import h5py
@@ -166,7 +167,7 @@ def filter_complete_points(
     return filtered_complete_points
 
 
-def backproject(depth, extrinsics, K):
+def backproject(depth, image, extrinsics, K):
     """
     Backproject depth map into 3D in world coordinate system.
     """
@@ -175,12 +176,14 @@ def backproject(depth, extrinsics, K):
     v = v.reshape([1, -1])[0]
 
     z = depth[v, u]
+    color = image[v, u]
 
     # remove invalid pixels (i.e., zero depth)
     non_inf_indices = np.argwhere(z > 0).T[0]
     z = z[non_inf_indices]
     u = u[non_inf_indices]
     v = v[non_inf_indices]
+    color = color[non_inf_indices]
 
     # calculate coordinates
     x = (u - K[0][2]) * z / K[0][0]
@@ -193,7 +196,14 @@ def backproject(depth, extrinsics, K):
     T = extrinsics[:3, 3]
     point_canonical = point_cam.dot(R.T) + T
 
-    return point_canonical
+    return point_canonical, color
+
+
+pose = None
+
+def pose_callback(scene):
+    global pose
+    pose = scene.camera_transform 
 
 
 def eval_scene(model, pipeline, args):
@@ -234,6 +244,7 @@ def eval_scene(model, pipeline, args):
         gt_images = []
         gt_depths = []
         gt_backprojected_point_cloud = []
+        gt_backprojected_colors = []
         for idx, camera in enumerate(scene.getTrainCameras()):
             image_idx = camera.image_name.split("_")[0]
 
@@ -248,14 +259,16 @@ def eval_scene(model, pipeline, args):
             gt_depth = np.load(os.path.join(depth_data_dir, f"{image_idx}_depth.npy"))
 
             # backproject depth
-            view_points = backproject(gt_depth, c2w, intrinsics)
+            view_points, view_colors = backproject(gt_depth, gt_image, c2w, intrinsics)
             gt_backprojected_point_cloud.append(view_points)
+            gt_backprojected_colors.append(view_colors)
 
             # only store test views
-            if idx < num_train_views:
+            if idx >= num_train_views:
                 gt_images.append(gt_image)
                 gt_depths.append(gt_depth)
         gt_backprojected_point_cloud = np.concatenate(gt_backprojected_point_cloud, axis=0)
+        gt_backprojected_colors = np.concatenate(gt_backprojected_colors, axis=0)
         gt_complete_point_cloud_data = np.load(
             os.path.join(scene_data_dir, "gt_mesh", "complete_scene.npz")
         )
@@ -281,6 +294,7 @@ def eval_scene(model, pipeline, args):
         gt_images = []
         gt_depths = []
         gt_backprojected_point_cloud = []
+        gt_backprojected_colors = []
         for idx, camera in enumerate(scene.getTrainCameras()):
             image_idx = camera.image_name.split("_")[0]
 
@@ -316,13 +330,15 @@ def eval_scene(model, pipeline, args):
                 gt_depth[gt_depth >= 10000000000.0] = 0.0
 
                 # backproject depth
-                view_points = backproject(gt_depth, c2w, intrinsics)
+                view_points, view_colors = backproject(gt_depth, gt_image, c2w, intrinsics)
                 gt_backprojected_point_cloud.append(view_points)
+                gt_backprojected_colors.append(view_colors)
 
-            if idx < num_train_views:
+            if idx >= num_train_views:
                 gt_images.append(gt_image)
                 gt_depths.append(gt_depth)
         gt_backprojected_point_cloud = np.concatenate(gt_backprojected_point_cloud, axis=0)
+        gt_backprojected_colors = np.concatenate(gt_backprojected_colors, axis=0)
         gt_complete_point_cloud_data = np.load(
             os.path.join(scene_data_dir, "gt_mesh", "scene.npz")
         )
@@ -337,56 +353,65 @@ def eval_scene(model, pipeline, args):
         ])
         gt_complete_point_cloud = gt_complete_point_cloud @ Rx.T
         gt_complete_point_cloud = filter_complete_points(gt_backprojected_point_cloud, gt_complete_point_cloud)
-    
-    # prepare prediction
-    predicted_mesh = trimesh.load(
-        os.path.join(os.path.dirname(args.source_path), "tetra_meshes", "tetra_mesh_binary_search_7_iter_7000.ply")
-    )
-    predicted_point_cloud = predicted_mesh.sample(500000)
-    predicted_point_cloud = filter_complete_points(gt_backprojected_point_cloud, predicted_point_cloud)
-    idx = voxelize(predicted_point_cloud, voxel_size=0.02)
-    predicted_point_cloud = torch.tensor(predicted_point_cloud[idx]).to("cuda").float()
-    predicted_point_cloud = predicted_point_cloud.view(1, -1, 3)
 
-    # prepare ground truth
-    gt_point_cloud = gt_complete_point_cloud
-    idx = voxelize(gt_point_cloud, voxel_size=0.02)
-    gt_point_cloud = torch.tensor(gt_point_cloud[idx]).to("cuda").float()
-    gt_point_cloud = gt_point_cloud.view(1, -1, 3)
+    # trimesh.PointCloud(gt_backprojected_point_cloud, colors=gt_backprojected_colors).show()
+    
+    # # prepare prediction
+    # predicted_mesh = trimesh.load(
+    #     os.path.join(os.path.dirname(args.source_path), "tetra_meshes", "tetra_mesh_binary_search_7_iter_7000.ply")
+    # )
+    # predicted_point_cloud = predicted_mesh.sample(500000)
+    # predicted_point_cloud = filter_complete_points(gt_backprojected_point_cloud, predicted_point_cloud)
+    # idx = voxelize(predicted_point_cloud, voxel_size=0.02)
+    # predicted_point_cloud = torch.tensor(predicted_point_cloud[idx]).to("cuda").float()
+    # predicted_point_cloud = predicted_point_cloud.view(1, -1, 3)
+
+    # # prepare ground truth
+    # gt_point_cloud = gt_complete_point_cloud
+    # idx = voxelize(gt_point_cloud, voxel_size=0.02)
+    # gt_point_cloud = torch.tensor(gt_point_cloud[idx]).to("cuda").float()
+    # gt_point_cloud = gt_point_cloud.view(1, -1, 3)
 
     # load partial point cloud
     partial_point_cloud = trimesh.load(
         os.path.join(args.source_path, "points.ply")
     )
+    partial_point_cloud.show(callback=pose_callback)
+    s = trimesh.Scene([partial_point_cloud])
+    input_image_path = os.path.join(args.output_path, "partial_input.png")
+    s.camera_transform = pose
+    image = s.save_image(resolution=(1440, 1080))
+    image = Image.open(io.BytesIO(image))
+    image.save(input_image_path)
     partial_point_cloud = np.array(partial_point_cloud.vertices)
     idx = voxelize(partial_point_cloud, voxel_size=0.02)
-    partial_point_cloud = torch.tensor(partial_point_cloud[idx]).to("cuda").float()
-    partial_point_cloud = partial_point_cloud.view(1, -1, 3)
+    # partial_point_cloud = torch.tensor(partial_point_cloud[idx]).to("cuda").float()
+    # partial_point_cloud = partial_point_cloud.view(1, -1, 3)
 
-    # prepare missing
-    dists, nn_idx, _ = knn_points(gt_point_cloud, partial_point_cloud, K=1)
-    dists = dists.squeeze(-1) ** 0.5
-    missing_point_cloud = gt_point_cloud[dists > 0.02].reshape(1, -1, 3)
+    # # prepare missing
+    # dists, nn_idx, _ = knn_points(gt_point_cloud, partial_point_cloud, K=1)
+    # dists = dists.squeeze(-1) ** 0.5
+    # missing_point_cloud = gt_point_cloud[dists > 0.02].reshape(1, -1, 3)
 
-    # Compute Chamfer Distance
-    cd, _ = chamfer_distance(gt_point_cloud, predicted_point_cloud)
-    cd = cd.item()
+    # # Compute Chamfer Distance
+    # cd, _ = chamfer_distance(gt_point_cloud, predicted_point_cloud)
+    # cd = cd.item()
 
-    # Compute Partial One-Sided Chamfer Distance
-    partial_cd, _ = chamfer_distance(partial_point_cloud, predicted_point_cloud, single_directional=True)
-    partial_cd = partial_cd.item()
+    # # Compute Partial One-Sided Chamfer Distance
+    # partial_cd, _ = chamfer_distance(partial_point_cloud, predicted_point_cloud, single_directional=True)
+    # partial_cd = partial_cd.item()
 
-    # Compute Complete One-Sided Chamfer Distance
-    complete_cd, _ = chamfer_distance(missing_point_cloud, predicted_point_cloud, single_directional=True)
-    complete_cd = complete_cd.item()
+    # # Compute Complete One-Sided Chamfer Distance
+    # complete_cd, _ = chamfer_distance(missing_point_cloud, predicted_point_cloud, single_directional=True)
+    # complete_cd = complete_cd.item()
     
-    # Color the input point cloud red ([255, 0, 0]) and the complete point cloud black ([0, 0, 0])
-    # red = np.tile(np.array([[255, 0, 0]]), (gt_backprojected_point_cloud.shape[0], 1))
-    # black = np.tile(np.array([[0, 0, 0]]), (gt_complete_point_cloud.shape[0], 1))
-    # gt_input_point_cloud = trimesh.PointCloud(gt_backprojected_point_cloud, colors=red)
-    # gt_point_cloud = trimesh.PointCloud(gt_complete_point_cloud, colors=black)
+    # # Color the input point cloud red ([255, 0, 0]) and the complete point cloud black ([0, 0, 0])
+    # # red = np.tile(np.array([[255, 0, 0]]), (gt_backprojected_point_cloud.shape[0], 1))
+    # # black = np.tile(np.array([[0, 0, 0]]), (gt_complete_point_cloud.shape[0], 1))
+    # # gt_input_point_cloud = trimesh.PointCloud(gt_backprojected_point_cloud, colors=red)
+    # # gt_point_cloud = trimesh.PointCloud(gt_complete_point_cloud, colors=black)
 
-    # trimesh.Scene([partial_point_cloud, gt_input_point_cloud, gt_point_cloud]).show()
+    # # trimesh.Scene([partial_point_cloud, gt_input_point_cloud, gt_point_cloud]).show()
     
     # render test viewpoints
     gaussExtractor = GaussianExtractor(gaussians, render, pipe, bg_color=bg_color)  
@@ -401,19 +426,42 @@ def eval_scene(model, pipeline, args):
         rendered_image = gaussExtractor.rgbmaps[idx].squeeze().permute(1, 2, 0).numpy()
         rendered_image = (rendered_image * 255).clip(0, 255).astype(np.uint8)
         image_path = os.path.join(args.output_path, f"rendered_rgb_{image_idx}.png")
-        imageio.imwrite(image_path, rendered_image)
+        # imageio.imwrite(image_path, rendered_image)
 
         rendered_depth = gaussExtractor.depthmaps[idx].squeeze().numpy()
         max_depth = np.max(gt_depths)
         min_depth = np.min(gt_depths)
         rendered_depth = (255 * ((rendered_depth - min_depth) / (max_depth - min_depth))).astype(np.uint8)
         depth_path = os.path.join(args.output_path, f"rendered_depth_{image_idx}.png")
-        imageio.imwrite(depth_path, rendered_depth)
+        # imageio.imwrite(depth_path, rendered_depth)
+
+     # L1 Depth Error
+    rendered_depths = torch.stack(gaussExtractor.depthmaps[num_train_views:], dim=0).squeeze().numpy()
+    gt_depths = np.array(gt_depths)
+    l1_depth = np.mean(np.abs(rendered_depths[gt_depths > 0] - gt_depths[gt_depths > 0]))
 
     # PSNR
     rendered_images = torch.clip(torch.stack(gaussExtractor.rgbmaps[num_train_views:], dim=0), 0.0, 1.0)
     rendered_images = rendered_images.cuda()
+    # print(rendered_images.shape)
+    gt_depth_tensor = torch.tensor(gt_depths).cuda()
+    gt_depth_tensor = gt_depth_tensor.unsqueeze(1).expand_as(rendered_images)
+    # print(gt_depth_tensor.shape)
+    rendered_images[gt_depth_tensor == 0.0] = 0.0
     gt_images = torch.tensor(gt_images).permute(0, 3, 1, 2).cuda().float() / 255.
+    for i in range(rendered_images.shape[0]):
+        rendered_image = rendered_images[i].permute(1, 2, 0).cpu().numpy()
+        gt_image = gt_images[i].permute(1, 2, 0).cpu().numpy()
+        # Plot both images side by side for visual comparison
+        fig, axs = plt.subplots(1, 2, figsize=(10, 5))
+        axs[0].imshow(rendered_image)
+        axs[0].set_title('Rendered Image')
+        axs[0].axis('off')
+        axs[1].imshow(gt_image)
+        axs[1].set_title('Ground Truth Image')
+        axs[1].axis('off')
+        plt.tight_layout()
+        plt.show()
     mse = F.mse_loss(rendered_images, gt_images, reduction='none')
     mse_per_image = mse.reshape(mse.shape[0], -1).mean(dim=1)
     psnr_per_image = -10 * torch.log10(mse_per_image + 1e-8)
@@ -427,24 +475,19 @@ def eval_scene(model, pipeline, args):
     lpips_value = lpips(rendered_images, gt_images)
     lpips_value = lpips_value.item()
 
-    # L1 Depth Error
-    rendered_depths = torch.stack(gaussExtractor.depthmaps[num_train_views:], dim=0).squeeze().numpy()
-    gt_depths = np.array(gt_depths)
-    l1_depth = np.mean(np.abs(rendered_depths - gt_depths))
-
     print(f"Evaluation Metrics:\n"
               f"PSNR: {psnr:.3f} dB\n"
               f"SSIM: {ssim_value:.4f}\n"
               f"LPIPS: {lpips_value:.4f}\n"
-              f"L1 Depth: {l1_depth: .4f}\n"
-              f"Chamfer Distance: {cd:.4f}\n"
-              f"Partial One-Sided Chamfer Distance: {partial_cd:.4f}\n"
-              f"Complete One-Sided Chamfer Distance: {complete_cd:.4f}")
+              f"L1 Depth: {l1_depth: .4f}\n")
+            #   f"Chamfer Distance: {cd:.4f}\n"
+            #   f"Partial One-Sided Chamfer Distance: {partial_cd:.4f}\n"
+            #   f"Complete One-Sided Chamfer Distance: {complete_cd:.4f}")
 
     eval_metrics = {}
-    eval_metrics['cd'] = cd
-    eval_metrics['partial_cd'] = partial_cd
-    eval_metrics['complete_cd'] = complete_cd
+    # eval_metrics['cd'] = cd
+    # eval_metrics['partial_cd'] = partial_cd
+    # eval_metrics['complete_cd'] = complete_cd
     eval_metrics['psnr'] = psnr
     eval_metrics['ssim'] = ssim_value
     eval_metrics['lpips'] = lpips_value
@@ -482,6 +525,9 @@ if __name__ == '__main__':
         "complete_cd": [],
     }
     for scene in scenes:
+        print(scene)
+        if scene != "130898f4-b33e-4c5c-93fb-c701f3c498da_SecondBedroom-36964":
+            continue
         scene_source_path = os.path.join(source_path, scene, "mast3r_sfm")
         scene_model_path = os.path.join(source_path, scene, "free_gaussians")
         scene_output_path = os.path.join(source_path, scene, "renders")
