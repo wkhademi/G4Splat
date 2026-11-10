@@ -92,7 +92,7 @@ class GaussianExtractor(object):
         self.depthmaps = []
         # self.alphamaps = []
         self.rgbmaps = []
-        # self.normals = []
+        self.normals = []
         # self.depth_normals = []
         self.viewpoint_stack = []
 
@@ -113,7 +113,7 @@ class GaussianExtractor(object):
             self.rgbmaps.append(rgb.cpu())
             self.depthmaps.append(depth.cpu())
             # self.alphamaps.append(alpha.cpu())
-            # self.normals.append(normal.cpu())
+            self.normals.append(normal.cpu())
             # self.depth_normals.append(depth_normal.cpu())
         
         # self.rgbmaps = torch.stack(self.rgbmaps, dim=0)
